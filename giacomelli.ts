@@ -1,15 +1,15 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { writeFile, mkdir, readFile } from "node:fs/promises";
+import { writeFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
 // ─── State persistence ────────────────────────────────────────────────────────
-// Agent and environment are created once and reused across runs.
-// Their IDs are persisted in .giacomelli-state.json next to this file.
+// Skill, agent and environment are created once and reused across runs.
 
 const STATE_FILE = path.join(import.meta.dir, ".giacomelli-state.json");
 
 interface State {
+  skillId: string;
   agentId: string;
   environmentId: string;
 }
@@ -27,90 +27,109 @@ async function saveState(state: State): Promise<void> {
   await writeFile(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// ─── Task ─────────────────────────────────────────────────────────────────────
-// The agent receives the pre-built scraper skill (giacomelli-scraper.js) as a
-// file upload and simply installs Playwright, then runs the script.
-// No exploration or script writing needed — the skill is fully self-contained.
+// ─── Cleanup helpers ──────────────────────────────────────────────────────────
 
-const SCRAPER_PATH = path.join(import.meta.dir, "giacomelli-scraper.js");
-const SCRAPER_SOURCE = await Bun.file(SCRAPER_PATH).text();
+async function cleanupExisting(client: Anthropic, state: State): Promise<void> {
+  console.log("Cleaning up existing agent and environment...");
 
-const TASK = `
-## Your task
-Run the property scraper skill to extract all residential listings from the Giacomelli website and save the results to \`/mnt/session/outputs/giacomelli_properties.json\`.
+  // Archive agent
+  try {
+    await (client.beta.agents as any).archive(state.agentId);
+    console.log(`  Archived agent: ${state.agentId}`);
+  } catch (e: any) {
+    console.log(`  Agent ${state.agentId} already gone or archived: ${e?.message}`);
+  }
 
-## The scraper skill
-Save the following content as \`giacomelli-scraper.js\` and run it with Node.js.
-The script is fully self-contained — do NOT modify it.
-
-\`\`\`javascript
-${SCRAPER_SOURCE}
-\`\`\`
-
-## Steps — execute in order, no investigation needed
-
-### 1. Install Playwright (skip if already present)
-\`\`\`bash
-npm install playwright && npx playwright install chromium && echo "ready"
-\`\`\`
-
-### 2. Save the scraper and add a package.json so Node treats it as ESM
-\`\`\`bash
-echo '{"type":"module"}' > package.json
-\`\`\`
-
-### 3. Run the scraper
-\`\`\`bash
-node giacomelli-scraper.js /mnt/session/outputs/giacomelli_properties.json
-\`\`\`
-
-### 4. Confirm
-Print the first few lines of the output file to confirm it is valid JSON with properties.
-Do NOT rewrite or debug the script — it is already correct and tested locally.
-`.trim();
+  // Delete environment
+  try {
+    await (client.beta.environments as any).delete(state.environmentId);
+    console.log(`  Deleted environment: ${state.environmentId}`);
+  } catch (e: any) {
+    console.log(`  Environment ${state.environmentId} already gone: ${e?.message}`);
+  }
+}
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 
 const client = new Anthropic();
 
-// ─── Ensure agent & environment exist (create once, reuse forever) ────────────
+// ─── Skill upload ─────────────────────────────────────────────────────────────
+// Skills beta header must be sent explicitly — not auto-set by SDK.
+
+const SKILL_DIR = path.join(import.meta.dir, "giacomelli-property-scraper");
+const SKILLS_BETA = "skills-2025-10-02";
+const AGENTS_BETA = "managed-agents-2026-04-01";
+
+async function uploadSkill(): Promise<string> {
+  console.log("Uploading skill from skill-giacomelli/...");
+
+  const fileNames = await readdir(SKILL_DIR);
+  const files: Anthropic.Uploadable[] = [];
+
+  for (const name of fileNames) {
+    const filePath = path.join(SKILL_DIR, name);
+    const content = await readFile(filePath);
+    // SDK expects Uploadable — use a File-like object
+    files.push(new File([content], `giacomelli-property-scraper/${name}`, {
+      type: name.endsWith(".md") ? "text/markdown" : "application/javascript",
+    }) as unknown as Anthropic.Uploadable);
+  }
+
+  const skill = await (client.beta.skills as any).create(
+    { display_title: "Giacomelli Property Scraper", files },
+    { headers: { "anthropic-beta": `${SKILLS_BETA},${AGENTS_BETA}` } },
+  );
+
+  console.log(`  Created skill: ${skill.id}`);
+  return skill.id as string;
+}
+
+// ─── Bootstrap: skill + agent + environment ───────────────────────────────────
 
 let state = await loadState();
 
 if (state) {
-  console.log(`Reusing agent: ${state.agentId}`);
-  console.log(`Reusing environment: ${state.environmentId}`);
-} else {
-  console.log("First run — creating agent and environment...");
-
-  const agent = await client.beta.agents.create({
-    name: "Giacomelli Property Scraper",
-    model: "claude-haiku-4-5-20251001",
-    system:
-      "You are a web scraping agent. You receive a ready-made Node.js scraper script. " +
-      "Your only job is to install Playwright, save the script to disk, run it, and confirm the output file exists. " +
-      "Do NOT rewrite or modify the script.",
-    tools: [{ type: "agent_toolset_20260401" }],
-  });
-  console.log(`Created agent: ${agent.id} (v${agent.version})`);
-
-  const environment = await client.beta.environments.create({
-    name: "giacomelli-scraper-env",
-    config: {
-      type: "cloud",
-      networking: { type: "unrestricted" }, // needs internet access for the website
-    },
-  });
-  console.log(`Created environment: ${environment.id}`);
-
-  state = { agentId: agent.id, environmentId: environment.id };
-  await saveState(state);
-  console.log(`State saved to ${STATE_FILE}`);
+  // Clean up old agent/env before creating fresh ones with the updated skill
+  await cleanupExisting(client, state);
 }
+
+console.log("Creating skill, agent, and environment...");
+
+const skillId = await uploadSkill();
+
+const agent = await client.beta.agents.create({
+  name: "Giacomelli Property Scraper",
+  model: "claude-haiku-4-5-20251001",
+  system:
+    "You are a web scraping agent. A skill called 'giacomelli-property-scraper' is available to you. " +
+    "Follow the skill instructions exactly: install Playwright, create package.json, run giacomelli-scraper.js. " +
+    "Do NOT modify the script.",
+  tools: [{ type: "agent_toolset_20260401" }],
+  skills: [{ type: "custom", skill_id: skillId }],
+} as any);
+console.log(`Created agent: ${agent.id} (model: claude-haiku-4-5-20251001, skill: ${skillId})`);
+
+const environment = await client.beta.environments.create({
+  name: "giacomelli-scraper-env",
+  config: {
+    type: "cloud",
+    networking: { type: "unrestricted" },
+  },
+});
+console.log(`Created environment: ${environment.id}`);
+
+state = { skillId, agentId: agent.id, environmentId: environment.id };
+await saveState(state);
+console.log(`State saved to ${STATE_FILE}`);
 
 // ─── Session runner ───────────────────────────────────────────────────────────
 
-async function runSession(title: string, task: string): Promise<void> {
+async function runSession(title: string): Promise<void> {
+  const task =
+    "Use the giacomelli-property-scraper skill to extract all residential property listings " +
+    "from the Giacomelli website. Follow the skill instructions step by step and save the output " +
+    "to /mnt/session/outputs/giacomelli_properties.json.";
+
   const session = await client.beta.sessions.create({
     agent: state!.agentId,
     environment_id: state!.environmentId,
@@ -124,10 +143,9 @@ async function runSession(title: string, task: string): Promise<void> {
   console.log(`[${title}] Session: ${session.id}`);
   console.log(`[${title}] Output dir: outputs/${session.id}/`);
 
-  // Open the event stream
   const stream = await client.beta.sessions.events.stream(session.id);
 
-  // Send work instruction — try define_outcome (Research Preview), fall back to message
+  // Send task — try define_outcome (Research Preview), fall back to user.message
   let usingOutcome = false;
   try {
     await client.beta.sessions.events.send(
@@ -139,43 +157,32 @@ async function runSession(title: string, task: string): Promise<void> {
           rubric: {
             type: "text",
             content: `
-# Web Scraping Task Rubric
-
+# Scraping Task Rubric
 ## Correctness
-- The script successfully navigates to the Giacomelli website
-- All available properties are loaded (including paginated ones via "Carregar mais")
-- Each property record contains: url, property_type, code, rental_price_brl, area_sqm, bedrooms, location
-
-## Output File
-- Output is saved to /mnt/session/outputs/giacomelli_properties.json
-- File contains valid JSON with metadata and properties array
-- At least 1 property is extracted (ideally all available)
-
-## Code Quality
-- Playwright is properly installed and used
-- Errors are handled gracefully
-- Summary statistics are printed to console
+- giacomelli-scraper.js is run without modification
+- Output file /mnt/session/outputs/giacomelli_properties.json exists and contains valid JSON
+- At least 100 properties are extracted
+## Completeness
+- Metadata includes extraction_date and properties_extracted count
+- Properties array contains url, rental_price_brl, area_sqm, bedrooms, location
             `.trim(),
           },
-          max_iterations: 3,
+          max_iterations: 2,
         } as any],
       },
       {
         headers: {
-          "anthropic-beta": "managed-agents-2026-04-01,managed-agents-2026-04-01-research-preview",
+          "anthropic-beta": `${AGENTS_BETA},managed-agents-2026-04-01-research-preview`,
         },
       },
     );
     usingOutcome = true;
-    console.log(`[${title}] Outcome defined — agent iterating toward rubric...`);
+    console.log(`[${title}] Outcome defined.`);
   } catch (err: any) {
     if (err?.status === 400 && err?.message?.includes("beta")) {
-      console.warn(`[${title}] define_outcome not available (Research Preview required) — using user.message`);
+      console.warn(`[${title}] define_outcome unavailable — using user.message`);
       await client.beta.sessions.events.send(session.id, {
-        events: [{
-          type: "user.message",
-          content: [{ type: "text", text: task }],
-        }],
+        events: [{ type: "user.message", content: [{ type: "text", text: task }] }],
       });
     } else {
       throw err;
@@ -194,16 +201,16 @@ async function runSession(title: string, task: string): Promise<void> {
         console.log(`\n[${title}] Tool: ${event.name}`);
         break;
       case "agent.tool_result":
-        break; // silent
+        break;
       case "span.outcome_evaluation_start":
-        console.log(`[${title}] Outcome eval iteration ${(event as any).iteration} started`);
+        console.log(`[${title}] Eval iteration ${(event as any).iteration}`);
         break;
       case "span.outcome_evaluation_ongoing":
         process.stdout.write(".");
         break;
       case "span.outcome_evaluation_end": {
         const ev = event as any;
-        console.log(`\n[${title}] Outcome eval result: ${ev.result}`);
+        console.log(`\n[${title}] Eval result: ${ev.result}`);
         if (ev.explanation) console.log(`[${title}]   ${ev.explanation}`);
         break;
       }
@@ -219,9 +226,8 @@ async function runSession(title: string, task: string): Promise<void> {
     if (event.type === "session.status_idle") break;
   }
 
-  // Download deliverables into outputs/<sessionId>/
+  // Download output files
   console.log(`[${title}] Fetching output files...`);
-
   const files = await client.beta.files.list(
     { scope_id: session.id },
     {
@@ -242,7 +248,6 @@ async function runSession(title: string, task: string): Promise<void> {
       await writeFile(dest, buffer);
       console.log(`[${title}] Downloaded → outputs/${session.id}/${filename} (${buffer.length} bytes)`);
 
-      // Print JSON summary without flooding the console
       if (filename.endsWith(".json")) {
         try {
           const parsed = JSON.parse(buffer.toString("utf-8"));
@@ -250,17 +255,14 @@ async function runSession(title: string, task: string): Promise<void> {
           const summary = parsed.summary ?? {};
           console.log(`\n── ${filename} summary ──`);
           console.log(`  Extraction date  : ${meta.extraction_date}`);
-          console.log(`  Properties found : ${meta.properties_extracted} / ${meta.total_properties_on_site} on site`);
+          console.log(`  Properties found : ${meta.properties_extracted} / ${meta.total_properties_on_site}`);
           console.log(`  By type          : ${JSON.stringify(summary.by_type ?? {})}`);
           console.log(`  Price range      : ${summary.price_range?.min} – ${summary.price_range?.max}`);
           console.log(`  Average price    : ${summary.price_range?.average}`);
-          // Also save a copy at the project root for quick access
           const rootCopy = path.join(import.meta.dir, "giacomelli_properties.json");
           await writeFile(rootCopy, buffer);
           console.log(`  Root copy saved  : giacomelli_properties.json`);
-        } catch {
-          // not valid JSON, skip summary
-        }
+        } catch { /* skip */ }
       }
     }
   }
@@ -268,17 +270,14 @@ async function runSession(title: string, task: string): Promise<void> {
   if (usingOutcome) {
     const retrieved = await client.beta.sessions.retrieve(session.id);
     const evaluations = (retrieved as any).outcome_evaluations ?? [];
-    if (evaluations.length) {
-      console.log(`[${title}] Outcome evaluations:`);
-      for (const oe of evaluations) {
-        console.log(`[${title}]   ${oe.outcome_id}: ${oe.result}`);
-      }
+    for (const oe of evaluations) {
+      console.log(`[${title}] Outcome: ${oe.outcome_id} → ${oe.result}`);
     }
   }
 }
 
-// ─── Run the scraping session ─────────────────────────────────────────────────
+// ─── Run ──────────────────────────────────────────────────────────────────────
 
-await runSession("giacomelli-scrape", TASK);
+await runSession("giacomelli-scrape");
 
-console.log("\nSession complete. Check outputs/ for the raw files and giacomelli_properties.json at the project root.");
+console.log("\nSession complete. Check outputs/ and giacomelli_properties.json.");
